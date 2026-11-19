@@ -1,0 +1,1216 @@
+---
+title: "IADRC hypothalamus: merge and availability"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+date: "2026-11-03 data release"
+---
+
+## How to run
+
+Open this file in RStudio and click **Knit**, or run its chunks from top to bottom.
+The input folder is already set below. Outputs go into a new `merged_outputs_R`
+subfolder; original files are never edited. Re-running replaces files in that
+output subfolder. This document uses **R only**, with no Python dependency.
+
+Install packages once in the RStudio Console if needed:
+
+```{r install-packages, eval=FALSE}
+install.packages(c("dplyr", "readr", "readxl", "stringr", "tibble",
+                   "knitr", "rmarkdown"))
+```
+
+The merge reproduces the rules used in the previously supplied package. The main
+files describe availability with **no maximum date gap**. Separate 180-day and
+365-day versions require every relevant clinical/PET/blood/sleep date to be
+within that window of MRI. These are alternative matching definitions, not
+clinically validated cutoffs. The report does not run association analyses.
+
+## 1. Settings and helper functions
+
+```{r setup, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = TRUE)
+required <- c("dplyr", "readr", "readxl", "stringr", "tibble")
+missing <- required[!vapply(required, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing)) stop("Install these packages first: ", paste(missing, collapse = ", "))
+if (packageVersion("dplyr") < "1.1.1") stop("Please update dplyr to version 1.1.1 or newer.")
+library(dplyr)
+library(readr)
+library(readxl)
+library(stringr)
+library(tibble)
+
+data_dir <- "/Users/yueran_li/Desktop/IUSM PhD/research plans/Hypothalamic AD/Data/3003_Li_Update"
+output_dir <- file.path(data_dir, "merged_outputs_R")
+stopifnot(dir.exists(data_dir))
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+date_windows <- c(180, 365)
+
+# Match a workbook by prefix; never silently take the first of several files.
+find_xlsx <- function(prefix) {
+  paths <- list.files(data_dir, pattern = "\\.xlsx$", full.names = TRUE)
+  paths <- paths[startsWith(basename(paths), prefix)]
+  if (length(paths) != 1L) stop("Expected exactly one workbook beginning '",
+                              prefix, "'; found ", length(paths), ": ",
+                              paste(basename(paths), collapse = ", "))
+  paths
+}
+save_csv <- function(x, name) {
+  write_csv(x, file.path(output_dir, paste0(name, ".csv")), na = "")
+}
+assert_unique <- function(x, keys, label) {
+  if (anyDuplicated(as.data.frame(x[keys]))) stop("Duplicate key in ", label)
+}
+read_table <- function(name) {
+  path <- file.path(data_dir, paste0("tbl_", name, "_2026-11-03.csv"))
+  if (!file.exists(path)) stop("Missing input: ", path)
+  # Read strings first to preserve participant IDs, then convert other types.
+  x <- read_csv(path, col_types = cols(.default = col_character()),
+                na = c("", "NA"), show_col_types = FALSE)
+  ids <- x$subid
+  x <- type_convert(x, na = c("", "NA"), trim_ws = TRUE)
+  x$subid <- as.character(ids)
+  x$source_row <- seq_len(nrow(x)) + 1L  # header is row 1
+  for (nm in names(x)[grepl("date", names(x))]) x[[nm]] <- as.Date(x[[nm]])
+  x
+}
+
+# Input records must already satisfy the requested domain's completeness rules.
+# Ties: smaller absolute gap, earlier date, then earlier source row.
+# A measurement can be reused for several MRI scans from the same participant.
+nearest_visit <- function(scans, records, date_col, prefix) {
+  stopifnot(all(c("subid", date_col, "source_row") %in% names(records)))
+  records <- records |> filter(!is.na(.data[[date_col]]))
+  fields <- setdiff(names(records), "subid")
+  rec <- records |> rename_with(~ paste0(prefix, .x), all_of(fields))
+  date_name <- paste0(prefix, date_col)
+  row_name <- paste0(prefix, "source_row")
+  scans |> select(subject, subid, mri_date) |>
+    left_join(rec, by = "subid", relationship = "many-to-many", na_matches = "never") |>
+    mutate(gap_days = as.numeric(.data[[date_name]] - mri_date),
+           abs_gap = abs(gap_days)) |>
+    arrange(subject, abs_gap, .data[[date_name]], .data[[row_name]]) |>
+    group_by(subject) |> slice_head(n = 1) |> ungroup() |>
+    select(subject, all_of(paste0(prefix, fields)), gap_days) |>
+    rename_with(~ paste0(prefix, "gap_days"), all_of("gap_days"))
+}
+```
+
+## 2. Hypothalamus volumes and scan-level QC
+
+The hypothalamus file contains **five subregions per hemisphere**, plus left and
+right totals. We retain original volumes and add bilateral sums. Each row remains
+one scan directory; multiple acquisitions on one day are not collapsed.
+
+FS QC **Excellent** and **Good** pass; Failed or missing QC do not. Exclusions
+from the supplied hypothalamus QC list apply to individual scans, not all visits
+from the participant.
+
+```{r hypothalamus-qc}
+hypo_path <- find_xlsx("IADRCprisma_hypothalamic_subunits_volumes_all")
+qc_path <- find_xlsx("Hypothalamus_QC_zero_and_3SD")
+fs_path <- find_xlsx("IADRCNICDerivatives-PrismaDemoDxATN")
+h <- read_excel(hypo_path, sheet = 1)
+assert_unique(h, "subject", "hypothalamus scan directories")
+volume_cols <- setdiff(names(h), "subject")
+names(h)[match(volume_cols, names(h))] <- paste0(
+  "hypo_", str_replace_all(volume_cols, "[ -]", "_"), "_mm3")
+h <- h |> mutate(
+  subid = str_match(subject, "sub-([0-9]+)")[, 2],
+  mri_date = as.Date(str_match(subject, "ses-([0-9]{8})")[, 2], "%Y%m%d")
+)
+stopifnot(!anyNA(h$subid), !anyNA(h$mri_date))
+regions <- c("anterior_inferior", "anterior_superior", "posterior",
+             "tubular_inferior", "tubular_superior")
+for (r in regions) {
+  h[[paste0("hypo_bilateral_", r, "_mm3")]] <-
+    h[[paste0("hypo_left_", r, "_mm3")]] + h[[paste0("hypo_right_", r, "_mm3")]]
+}
+h$hypo_total_mm3 <- h$hypo_whole_left_mm3 + h$hypo_whole_right_mm3
+qc <- read_excel(qc_path, sheet = "Flagged scans")
+h$hypo_flagged <- h$subject %in% qc$`Scan ID`
+fs <- read_excel(fs_path, sheet = "Freesurfer") |>
+  transmute(subject = `Name of Imaging Directory`, fs_qc = `FreeSurfer QC Rating`,
+            fs_etiv_reference_mm3 = eTIV)
+assert_unique(fs, "subject", "FreeSurfer QC")
+h <- left_join(h, fs, by = "subject", relationship = "one-to-one")
+count(h, fs_qc, hypo_flagged)
+```
+
+## 3. Match MRI CSV eTIV to the correct acquisition
+
+Use participant + **exact MRI date**. When multiple MRI records occur that day,
+use the QC workbook's eTIV as a reference (tolerance 0.01 mm³). The value saved as
+`etiv_mm3` always comes from the November MRI CSV. Identical selected MRI fields
+are collapsed for matching. Unresolved multiple candidates receive missing eTIV.
+
+If only one distinct MRI record remains but its eTIV disagrees with the QC
+workbook, retain it with `date_only_eTIV_discordant`. These scans need acquisition
+confirmation before final analysis; the code also saves their audit separately.
+
+```{r match-mri}
+mri <- read_table("MRI")
+mri_fields <- c("visitdate", "resolution_7", "etiv_7",
+                "left_hippocampus_7", "right_hippocampus_7")
+mri_matches <- lapply(seq_len(nrow(h)), function(i) {
+  scan <- h[i, ]
+  g <- mri |> filter(subid == scan$subid, mri_date == scan$mri_date)
+  result <- tibble(subject = scan$subject, mri_candidate_rows = nrow(g),
+                   mri_match_status = "no_exact_MRI_date")
+  # Typed empty template also covers scans without a candidate.
+  selected <- mri[NA_integer_, c(mri_fields, "source_row")]
+  if (nrow(g)) {
+    exact <- g |> filter(!is.na(etiv_7), !is.na(scan$fs_etiv_reference_mm3),
+                         abs(etiv_7 - scan$fs_etiv_reference_mm3) <= 0.01)
+    if (nrow(exact)) {
+      g <- exact
+      result$mri_match_status <- "date_and_FS_eTIV_concordant"
+    } else result$mri_match_status <- "date_only_eTIV_discordant"
+    if (nrow(distinct(g, across(all_of(mri_fields)))) == 1L) {
+      selected <- g[1, c(mri_fields, "source_row")]
+    } else result$mri_match_status <- "unresolved_multiple_acquisitions"
+  }
+  bind_cols(result, selected)
+}) |> bind_rows() |>
+  rename(mri_linked_visitdate = visitdate, etiv_mm3 = etiv_7,
+         mri_source_row = source_row)
+h <- left_join(h, mri_matches, by = "subject", relationship = "one-to-one")
+```
+
+## 4. Demographics, diagnosis, age and base inclusion
+
+Sex and APOE come from the participant table. Genotypes 24/34/44 are ε4 positive;
+22/23/33 are negative. Age at MRI is approximated from the nearest eligible
+clinical visit's age plus elapsed years; original clinical age is retained.
+Diagnosis categories are retained exactly, without a CN/CI recoding.
+
+```{r base-dataset}
+par <- read_table("PAR")
+assert_unique(par, "subid", "participant table")
+h <- h |> left_join(select(par, subid, sex, apoegenotype, educ),
+                    by = "subid", relationship = "many-to-one") |>
+  mutate(
+    apoe4_status = case_when(apoegenotype %in% c(22, 23, 33) ~ 0L,
+                            apoegenotype %in% c(24, 34, 44) ~ 1L,
+                            TRUE ~ NA_integer_),
+    apoe4_allele_count = case_when(apoegenotype %in% c(22, 23, 33) ~ 0L,
+                                  apoegenotype %in% c(24, 34) ~ 1L,
+                                  apoegenotype == 44 ~ 2L, TRUE ~ NA_integer_)
+  )
+diag <- read_table("DIAG") |>
+  filter(!is.na(diagnosis), !is.na(visitage)) |>
+  select(subid, visitdate, diagnosis, syndrome, subtype, contributing_cond,
+         visitage, source_row)
+h <- h |> left_join(nearest_visit(h, diag, "visitdate", "dx_"),
+                    by = "subject", relationship = "one-to-one") |>
+  mutate(age_at_mri_years = dx_visitage - dx_gap_days / 365.25) |>
+  group_by(subid, mri_date) |> mutate(same_day_scan_count = n()) |> ungroup()
+criteria <- list(
+  "All hypothalamus scans" = rep(TRUE, nrow(h)),
+  "FS QC Excellent or Good" = h$fs_qc %in% c("Excellent", "Good"),
+  "Unflagged hypothalamus" = !h$hypo_flagged,
+  "Matched positive MRI CSV eTIV" = !is.na(h$etiv_mm3) & h$etiv_mm3 > 0,
+  "Age, sex, diagnosis, APOE4 available" = !is.na(h$age_at_mri_years) &
+    h$sex %in% c("F", "M") & !is.na(h$dx_diagnosis) & !is.na(h$apoe4_status)
+)
+keep <- rep(TRUE, nrow(h))
+flow <- list()
+for (step in names(criteria)) {
+  before <- sum(keep)
+  keep <- keep & coalesce(criteria[[step]], FALSE)
+  flow[[step]] <- tibble(step, scan_rows = sum(keep),
+                         participants = n_distinct(h$subid[keep]),
+                         excluded_at_step = before - sum(keep))
+}
+inclusion_flow <- bind_rows(flow)
+h$included_base <- keep
+base <- filter(h, included_base)
+save_csv(h, "scan_inclusion_audit")
+save_csv(inclusion_flow, "inclusion_flow")
+save_csv(filter(base, mri_match_status != "date_and_FS_eTIV_concordant"),
+         "base_MRI_matches_needing_review")
+knitr::kable(inclusion_flow)
+```
+
+## 5. PET and hippocampal neurodegeneration datasets
+
+ATNV is joined by participant + exact MRI date, preserving the data core's PET
+linkage and PET measurement dates. Only positive/negative statuses qualify;
+ambiguous amyloid remains in the audit. `n_hippo` is the supplied dimensionless
+mean left/right hippocampal volume divided by intracranial volume. It is not
+recalculated, and no new threshold is applied. On dates with multiple acquisitions,
+ATNV's hippocampal ratio may refer to only one acquisition.
+
+```{r pet-datasets}
+atnv <- read_table("ATNV") |>
+  rename(mri_date = mri_date_atnv, atnv_source_row = source_row) |>
+  select(-any_of("threshold_date"))
+assert_unique(atnv, c("subid", "mri_date"), "ATNV participant/MRI-date keys")
+master <- base |> left_join(atnv, by = c("subid", "mri_date"),
+                            relationship = "many-to-one") |>
+  mutate(amy_date_atnv_gap_days = as.numeric(amy_date_atnv - mri_date),
+         tau_date_atnv_gap_days = as.numeric(tau_date_atnv - mri_date))
+definitive <- function(x) x %in% c("positive", "negative")
+datasets <- list(
+  "01_base" = base,
+  "02_base_amyloid" = filter(master, definitive(amyloid_status)),
+  "03_base_amyloid_tau" = filter(master, definitive(amyloid_status),
+                                  definitive(tau_tmr_status)),
+  "04_base_amyloid_tau_hippo" = filter(master, definitive(amyloid_status),
+    definitive(tau_tmr_status), definitive(n_hippo_status), !is.na(n_hippo), n_hippo > 0)
+)
+save_csv(master, "base_ATNV_audit_including_ambiguous")
+```
+
+## 6. Compare plasma assays and select the most available pair
+
+Only PLASMA is included. Eligible results have positive values and either no flag
+or a flag explicitly saying "ok to use". Other flagged records are conservatively
+excluded, even if their flag concerns a different analyte, and saved for review.
+Conflicting values from the same assay/marker and collection date are excluded
+rather than averaged. Identical repeat values use the latest assay date, then
+latest source row. Assay versions are kept separate; platform metadata is retained.
+An assay with multiple explicitly identified platforms stops for review.
+
+Choose the Aβ/p-tau assay pair with the most **unique base participants**, requiring
+both markers on the same collection date. Break ties using scan coverage, then
+preference for a reported Aβ42/40 ratio. This measures availability, not clinical
+superiority. The original files select Lumipulse Aβ42 plus pTau217 plus.
+
+```{r plasma-availability}
+
+
+# Keep only unflagged plasma records
+blood <- read_table("BLDBIOM") |>
+  filter(
+    specimen_type == "PLASMA",
+    is.na(flagged) | trimws(flagged) == ""
+  )
+
+# One available Aβ42/40 result per participant
+ab <- blood |>
+  filter(!is.na(ab4240ratio)) |>
+  distinct(subid, .keep_all = TRUE) |>
+  transmute(
+    subid,
+    ab4240ratio,
+    ab_date = procedure_date,
+    ab_assay = assay_name
+  )
+
+# One available p-tau217 result per participant
+tau <- blood |>
+  filter(!is.na(ptau217)) |>
+  distinct(subid, .keep_all = TRUE) |>
+  transmute(
+    subid,
+    ptau217,
+    ptau_date = procedure_date,
+    ptau_assay = assay_name
+  )
+
+# Match by ID; retain only participants with BOTH biomarkers
+plasma <- base |>
+  inner_join(ab, by = "subid", relationship = "many-to-one") |>
+  inner_join(tau, by = "subid", relationship = "many-to-one")
+
+datasets[["05_base_plasma"]] <- plasma
+
+# Show final dataset
+View(plasma)
+
+# Show sample size
+plasma |>
+  summarise(
+    subjects = n_distinct(subid),
+    scans = n_distinct(subject)
+  )
+
+# Save
+save_csv(plasma, "05_base_plasma_ab4240ratio_ptau217")
+
+
+
+```
+
+The concentration units should be confirmed with the data core before reporting
+concentrations. Values are not rescaled or harmonized. The derived ratio assumes
+the Aβ42 and Aβ40 concentrations share units and is an additional variable, not a
+separate candidate in the availability ranking.
+
+## 7. Complete sleep dataset
+
+Require **all nine items from one visit**, then choose that participant's nearest
+complete visit to MRI. A nearer incomplete visit can therefore be bypassed.
+The updated data should contain only 0–3 codes; invalid codes stop the merge.
+No PSQI global score is calculated.
+
+```{r sleep-dataset}
+sleep_raw <- read_table("SLEEP")
+psq <- paste0("psq5", letters[1:9])
+values <- unlist(sleep_raw[psq], use.names = FALSE)
+if (any(!is.na(values) & !(values %in% 0:3))) stop("PSQI values outside 0–3; check coding before merging.")
+sleep_complete <- sleep_raw |>
+  filter(if_all(all_of(psq), ~ !is.na(.x))) |>
+  select(subid, visitdate, source_row, all_of(psq))
+sleep <- base |> left_join(nearest_visit(base, sleep_complete, "visitdate", "sleep_"),
+                           by = "subject", relationship = "one-to-one") |>
+  filter(if_all(all_of(paste0("sleep_", psq)), ~ !is.na(.x)))
+datasets[["06_base_sleep"]] <- sleep
+```
+
+## 8. Export all datasets, date-window variants and counts
+
+CSV files open in Excel and can be read with `read_csv()`. The RDS file preserves
+R column types and holds all six main datasets in one named list.
+`*_gap_days` is the measurement date minus MRI date: negative means before MRI.
+Missing required dates fail the date-window filter. These filters apply to
+diagnosis **as well as** the additional modality.
+
+```{r export-and-check}
+summarize_dataset <- function(x, name) {
+  repeated <- x |> group_by(subid) |> summarise(n_dates = n_distinct(mri_date), .groups = "drop")
+  tibble(dataset = name, scan_rows = nrow(x), participants = n_distinct(x$subid),
+         distinct_MRI_dates = nrow(distinct(x, subid, mri_date)),
+         participants_with_2plus_MRI_dates = sum(repeated$n_dates >= 2))
+}
+gap_columns <- function(name) {
+  cols <- "dx_gap_days"
+  if (name %in% c("02_base_amyloid", "03_base_amyloid_tau", "04_base_amyloid_tau_hippo"))
+    cols <- c(cols, "amy_date_atnv_gap_days")
+  if (name %in% c("03_base_amyloid_tau", "04_base_amyloid_tau_hippo"))
+    cols <- c(cols, "tau_date_atnv_gap_days")
+  if (name == "05_base_plasma") cols <- c(cols, "blood_gap_days")
+  if (name == "06_base_sleep") cols <- c(cols, "sleep_gap_days")
+  cols
+}
+counts <- list()
+window_counts <- list()
+gap_summary <- list()
+for (name in names(datasets)) {
+  x <- datasets[[name]]
+  assert_unique(x, "subject", name)
+  stopifnot(all(x$subject %in% base$subject))
+  save_csv(x, name)
+  counts[[name]] <- summarize_dataset(x, name)
+  cols <- gap_columns(name)
+  for (window in date_windows) {
+    limited <- x |> filter(if_all(all_of(cols), ~ !is.na(.x) & abs(.x) <= window))
+    save_csv(limited, paste0(name, "_within_", window, "d"))
+    window_counts[[paste(name, window)]] <- tibble(dataset = name,
+      window_days_all_modalities = window, scan_rows = nrow(limited),
+      participants = n_distinct(limited$subid))
+  }
+  for (col in cols) {
+    gaps <- abs(x[[col]]); gaps <- gaps[!is.na(gaps)]
+    gap_summary[[paste(name, col)]] <- tibble(dataset = name, gap_variable = col,
+      median_abs_days = if (length(gaps)) median(gaps) else NA_real_,
+      max_abs_days = if (length(gaps)) max(gaps) else NA_real_)
+  }
+}
+dataset_counts <- bind_rows(counts)
+time_window_counts <- bind_rows(window_counts)
+match_gap_summary <- bind_rows(gap_summary)
+save_csv(dataset_counts, "dataset_counts")
+save_csv(time_window_counts, "time_window_counts")
+save_csv(match_gap_summary, "match_gap_summary")
+saveRDS(datasets, file.path(output_dir, "IADRC_merged_datasets.rds"))
+
+stopifnot(!any(base$hypo_flagged), all(base$fs_qc %in% c("Excellent", "Good")),
+  all(datasets[["04_base_amyloid_tau_hippo"]]$subject %in% datasets[["03_base_amyloid_tau"]]$subject),
+  all(datasets[["03_base_amyloid_tau"]]$subject %in% datasets[["02_base_amyloid"]]$subject))
+knitr::kable(dataset_counts)
+knitr::kable(time_window_counts)
+knitr::kable(match_gap_summary)
+```
+
+For the original supplied files, the prior merge produced these unrestricted
+counts. A mismatch here is a prompt to review source versions or merge behavior,
+not a reason to force records into the expected count.
+
+```{r compare-previous-counts}
+expected <- tibble(dataset = names(datasets),
+  expected_scan_rows = c(974L, 258L, 73L, 73L, 543L, 786L),
+  expected_participants = c(587L, 229L, 72L, 72L, 291L, 444L))
+count_check <- dataset_counts |> left_join(expected, by = "dataset") |>
+  mutate(matches_previous = scan_rows == expected_scan_rows & participants == expected_participants)
+save_csv(count_check, "comparison_with_previous_merge")
+if (!all(count_check$matches_previous)) warning("Counts differ from the previous merge; review comparison_with_previous_merge.csv.")
+knitr::kable(count_check)
+cat("Output folder:", output_dir)
+```
+
+## 9. Using the results
+
+```{r examples, eval=FALSE}
+# Six main datasets are already available in the named list 'datasets'.
+base <- datasets[["01_base"]]
+pet_at <- datasets[["03_base_amyloid_tau"]]
+
+# Or reload them in a new R session:
+datasets <- readRDS(file.path(output_dir, "IADRC_merged_datasets.rds"))
+
+# A time-limited dataset:
+sleep_365 <- read_csv(file.path(output_dir, "06_base_sleep_within_365d.csv"))
+
+# Optional stricter acquisition match (changes sample size):
+base_concordant <- datasets[["01_base"]] |>
+  filter(mri_match_status == "date_and_FS_eTIV_concordant")
+```
+
+Keep repeated MRI dates/acquisitions in mind when defining a cross-sectional or
+longitudinal analysis. This merge does not choose one baseline scan per person or
+average same-day acquisitions. In the prior base dataset, 30 scan rows had
+discordant eTIV matches and require review. Unrestricted matches can be years
+apart; review the date-gap summaries before choosing an analysis cohort.
+
+```{r session-info}
+sessionInfo()
+```
+
+```{r}
+
+
+
+# 1. One scan per participant: earliest eligible scan
+dat <- datasets[["01_base"]] |>
+  arrange(subid, mri_date, subject) |>
+  distinct(subid, .keep_all = TRUE) |>
+  mutate(
+    age = age_at_mri_years,
+    sex_binary = case_when(
+      sex == "F" ~ 0,
+      sex == "M" ~ 1,
+      TRUE ~ NA_real_
+    ),
+    etiv = etiv_mm3,
+    dx_original = str_squish(dx_diagnosis),
+
+    # Exclude "Impaired, not MCI" BEFORE matching other MCI labels
+    dx = case_when(
+      str_to_lower(dx_original) == "impaired, not mci" ~ NA_character_,
+      str_detect(dx_original, regex("MCI", ignore_case = TRUE)) ~ "MCI",
+      str_detect(dx_original, regex("^SCD", ignore_case = TRUE)) ~ "Normal",
+      str_to_lower(dx_original) == "normal" ~ "Normal",
+      str_to_lower(dx_original) == "dementia" ~ "Dementia",
+      TRUE ~ NA_character_
+    ),
+    dx = factor(dx, levels = c("Normal", "MCI", "Dementia"))
+  )
+
+# Show original-to-new diagnosis mapping
+dat |>
+  count(dx_original, dx, name = "n") |>
+  print(n = Inf)
+
+# Exclude unmapped diagnoses from diagnosis analyses only
+dat_dx <- dat |>
+  filter(!is.na(dx))
+
+# Show diagnosis sample sizes
+dat_dx |>
+  count(dx, name = "n", .drop = FALSE) |>
+  print(n = Inf)
+
+
+# Bilateral volumes: left + right
+regions <- c(
+  "Anterior inferior" = "hypo_bilateral_anterior_inferior_mm3",
+  "Anterior superior" = "hypo_bilateral_anterior_superior_mm3",
+  "Posterior"         = "hypo_bilateral_posterior_mm3",
+  "Tubular inferior"  = "hypo_bilateral_tubular_inferior_mm3",
+  "Tubular superior"  = "hypo_bilateral_tubular_superior_mm3",
+  "Total"            = "hypo_total_mm3"
+)
+
+
+# 2. Age, sex and three-category diagnosis analyses
+results <- bind_rows(lapply(names(regions), function(region) {
+
+  volume_col <- regions[[region]]
+
+  # Age and sex: partial correlations controlling for eTIV
+  # Uses all participants in dat, including "Impaired, not MCI"
+  correlations <- bind_rows(lapply(c("age", "sex_binary"), function(pred) {
+
+    d <- data.frame(
+      volume = dat[[volume_col]],
+      predictor = dat[[pred]],
+      etiv = dat$etiv
+    )
+    d <- d[complete.cases(d), ]
+
+    volume_resid <- residuals(lm(volume ~ etiv, data = d))
+    predictor_resid <- residuals(lm(predictor ~ etiv, data = d))
+
+    r <- cor(volume_resid, predictor_resid)
+
+    df <- nrow(d) - 3
+    t_value <- r * sqrt(df / (1 - r^2))
+    p_value <- 2 * pt(abs(t_value), df = df, lower.tail = FALSE)
+
+    tibble(
+      region = region,
+      predictor = ifelse(pred == "age", "Age", "Sex"),
+      method = "Partial correlation controlling for eTIV",
+      n = nrow(d),
+      effect_type = "partial_r",
+      effect = r,
+      statistic = t_value,
+      df1 = 1,
+      df2 = df,
+      p = p_value
+    )
+  }))
+
+  # Diagnosis: Normal, MCI and Dementia only
+  d <- data.frame(
+    volume = dat_dx[[volume_col]],
+    dx = dat_dx$dx,
+    etiv = dat_dx$etiv
+  )
+  d <- d[complete.cases(d), ]
+  d$dx <- droplevels(d$dx)
+
+  reduced <- lm(volume ~ etiv, data = d)
+  full <- lm(volume ~ etiv + dx, data = d)
+
+  # Omnibus diagnosis effect after accounting for eTIV
+  comparison <- anova(reduced, full)
+
+  partial_eta2 <- (
+    deviance(reduced) - deviance(full)
+  ) / deviance(reduced)
+
+  diagnosis <- tibble(
+    region = region,
+    predictor = "Diagnosis",
+    method = "ANCOVA adjusting for eTIV",
+    n = nrow(d),
+    effect_type = "partial_eta_squared",
+    effect = partial_eta2,
+    statistic = comparison$F[2],
+    df1 = comparison$Df[2],
+    df2 = df.residual(full),
+    p = comparison$`Pr(>F)`[2]
+  )
+
+  bind_rows(correlations, diagnosis)
+}))
+
+
+# 3. FDR across all 18 tests
+results <- results |>
+  mutate(
+    p_fdr = p.adjust(p, method = "BH"),
+    significant_fdr = p_fdr < 0.05
+  )
+
+results |>
+  mutate(across(c(effect, statistic, p, p_fdr), ~ signif(.x, 4))) |>
+  print(n = Inf, width = Inf)
+
+
+# 4. Whole-hypothalamus differences compared with Normal
+whole_dat <- dat_dx |>
+  filter(
+    !is.na(hypo_total_mm3),
+    !is.na(etiv)
+  )
+
+# Ensure all three groups are present
+stopifnot(
+  all(c("Normal", "MCI", "Dementia") %in% as.character(whole_dat$dx))
+)
+
+# Explicitly use Normal as the reference group
+whole_dat$dx <- factor(
+  whole_dat$dx,
+  levels = c("Normal", "MCI", "Dementia")
+)
+contrasts(whole_dat$dx) <- contr.treatment(
+  levels(whole_dat$dx),
+  base = 1
+)
+
+whole_fit <- lm(
+  hypo_total_mm3 ~ etiv + dx,
+  data = whole_dat
+)
+
+coef_table <- summary(whole_fit)$coefficients
+ci <- confint(whole_fit, level = 0.95)
+
+terms <- c("dxMCI", "dxDementia")
+
+whole_contrasts <- tibble(
+  comparison = c("MCI vs Normal", "Dementia vs Normal"),
+  n_normal = sum(whole_dat$dx == "Normal"),
+  n_comparison = c(
+    sum(whole_dat$dx == "MCI"),
+    sum(whole_dat$dx == "Dementia")
+  ),
+  n_model = nrow(whole_dat),
+  difference_mm3 = unname(coef_table[terms, "Estimate"]),
+  SE = unname(coef_table[terms, "Std. Error"]),
+  CI_lower = unname(ci[terms, 1]),
+  CI_upper = unname(ci[terms, 2]),
+  p = unname(coef_table[terms, "Pr(>|t|)"])
+) |>
+  mutate(
+    # Separate FDR family for these two additional contrasts
+    p_fdr = p.adjust(p, method = "BH"),
+    significant_fdr = p_fdr < 0.05
+  )
+
+whole_contrasts |>
+  mutate(
+    across(c(difference_mm3, SE, CI_lower, CI_upper), ~ round(.x, 2)),
+    across(c(p, p_fdr), ~ signif(.x, 4))
+  ) |>
+  print(n = Inf, width = Inf)
+
+
+# 5. Save results
+write.csv(
+  results,
+  file.path(output_dir, "hypothalamus_age_sex_dx3_adjusted_eTIV_FDR.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  whole_contrasts,
+  file.path(output_dir, "whole_hypothalamus_MCI_Dementia_vs_Normal.csv"),
+  row.names = FALSE
+)
+```
+
+```{r}
+
+
+# 1. Prepare diagnosis dataset
+# dat_dx already contains Normal/SCD, MCI and Dementia,
+# excluding "Impaired, not MCI".
+dx_dat <- dat_dx |>
+  mutate(
+    dx = factor(dx, levels = c("Normal", "MCI", "Dementia")),
+    sex = factor(sex, levels = c("F", "M"))
+  ) |>
+  filter(
+    !is.na(dx),
+    !is.na(etiv),
+    !is.na(age),
+    !is.na(sex)
+  )
+
+# Explicitly set Normal as the reference
+contrasts(dx_dat$dx) <- contr.treatment(
+  levels(dx_dat$dx), base = 1
+)
+
+# Participant counts
+dx_dat |> count(dx, name = "n") |> print()
+
+
+# 2. Omnibus diagnosis effect for each region
+dx_results <- bind_rows(lapply(names(regions), function(region) {
+
+  d <- dx_dat |>
+    mutate(volume = .data[[regions[[region]]]]) |>
+    filter(!is.na(volume))
+
+  # Both models use exactly the same participants
+  reduced <- lm(volume ~ etiv + age + sex, data = d)
+  full <- lm(volume ~ etiv + age + sex + dx, data = d)
+
+  comparison <- anova(reduced, full)
+
+  tibble(
+    region = region,
+    n = nrow(d),
+    partial_eta_squared =
+      (deviance(reduced) - deviance(full)) / deviance(reduced),
+    F = comparison$F[2],
+    df1 = comparison$Df[2],
+    df2 = df.residual(full),
+    p = comparison$`Pr(>F)`[2]
+  )
+}))
+
+# FDR across the six diagnosis tests
+dx_results <- dx_results |>
+  mutate(
+    p_fdr = p.adjust(p, method = "BH"),
+    significant_fdr = p_fdr < 0.05
+  )
+
+dx_results |>
+  mutate(across(c(partial_eta_squared, F, p, p_fdr), ~ signif(.x, 4))) |>
+  print(n = Inf, width = Inf)
+
+
+# 3. Whole-hypothalamus differences versus Normal
+whole_dat <- dx_dat |>
+  filter(!is.na(hypo_total_mm3))
+
+stopifnot(
+  all(c("Normal", "MCI", "Dementia") %in% as.character(whole_dat$dx))
+)
+
+whole_fit <- lm(
+  hypo_total_mm3 ~ etiv + age + sex + dx,
+  data = whole_dat
+)
+
+coef_table <- summary(whole_fit)$coefficients
+ci <- confint(whole_fit, level = 0.95)
+terms <- c("dxMCI", "dxDementia")
+
+whole_contrasts <- tibble(
+  comparison = c("MCI vs Normal", "Dementia vs Normal"),
+  n_normal = sum(whole_dat$dx == "Normal"),
+  n_comparison = c(
+    sum(whole_dat$dx == "MCI"),
+    sum(whole_dat$dx == "Dementia")
+  ),
+  n_model = nrow(whole_dat),
+  difference_mm3 = unname(coef_table[terms, "Estimate"]),
+  SE = unname(coef_table[terms, "Std. Error"]),
+  CI_lower = unname(ci[terms, 1]),
+  CI_upper = unname(ci[terms, 2]),
+  p = unname(coef_table[terms, "Pr(>|t|)"])
+) |>
+  mutate(
+    p_fdr = p.adjust(p, method = "BH"),
+    significant_fdr = p_fdr < 0.05
+  )
+
+whole_contrasts |>
+  mutate(
+    across(c(difference_mm3, SE, CI_lower, CI_upper), ~ round(.x, 2)),
+    across(c(p, p_fdr), ~ signif(.x, 4))
+  ) |>
+  print(n = Inf, width = Inf)
+
+
+# 4. Save
+write.csv(
+  dx_results,
+  file.path(output_dir, "hypothalamus_dx_adjusted_eTIV_age_sex_FDR.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  whole_contrasts,
+  file.path(output_dir, "whole_hypothalamus_dx_contrasts_eTIV_age_sex.csv"),
+  row.names = FALSE
+)
+```
+```{r}
+
+
+# 1. Keep the earliest eligible MRI for each participant
+earliest_scan <- function(data) {
+  data |>
+    arrange(subid, mri_date, subject) |>
+    distinct(subid, .keep_all = TRUE)
+}
+
+base_dat   <- earliest_scan(datasets[["01_base"]])
+plasma_dat <- earliest_scan(datasets[["05_base_plasma"]])
+
+# 2. Bilateral subregion volumes and whole hypothalamus volume (mm³)
+regions <- c(
+  "Anterior inferior"  = "hypo_bilateral_anterior_inferior_mm3",
+  "Anterior superior"  = "hypo_bilateral_anterior_superior_mm3",
+  "Posterior"          = "hypo_bilateral_posterior_mm3",
+  "Tubular inferior"   = "hypo_bilateral_tubular_inferior_mm3",
+  "Tubular superior"   = "hypo_bilateral_tubular_superior_mm3",
+  "Whole hypothalamus" = "hypo_total_mm3"
+)
+
+# 3. Test one predictor across all six volumes, adjusting for eTIV
+test_predictor <- function(data, predictor_col, label) {
+  bind_rows(lapply(names(regions), function(region) {
+
+    formula <- reformulate(
+      c("etiv_mm3", predictor_col),
+      response = regions[[region]]
+    )
+    fit <- lm(formula, data = data, na.action = na.omit)
+
+    term <- coef(summary(fit))[predictor_col, ]
+    t_value <- unname(term["t value"])
+    df <- df.residual(fit)
+
+    tibble(
+      region    = region,
+      predictor = label,
+      n         = nobs(fit),
+      B_mm3     = unname(term["Estimate"]),
+      partial_r = t_value / sqrt(t_value^2 + df),
+      p         = unname(term["Pr(>|t|)"])
+    )
+  }))
+}
+
+# 4. Combine all 18 tests and apply FDR correction once
+results_etiv <- bind_rows(
+  test_predictor(base_dat,   "apoe4_status", "APOE ε4 carrier"),
+  test_predictor(plasma_dat, "ab4240ratio",  "Plasma Aβ42/40"),
+  test_predictor(plasma_dat, "ptau217",      "Plasma p-tau217")
+) |>
+  mutate(
+    p_fdr = p.adjust(p, method = "BH"),
+    significant_fdr = p_fdr < 0.05
+  )
+
+print(results_etiv, n = Inf, width = Inf)
+
+
+
+```
+```{r}
+library(dplyr)
+library(purrr)
+
+
+
+# All QC-eligible base MRIs are candidates, including follow-up MRIs.
+mri_pool <- datasets[["01_base"]] |>
+  mutate(mri_date = as.Date(mri_date)) |>
+  filter(!is.na(subid), !is.na(mri_date))
+
+closest_mri_to_pet <- function(pet_date_col, status_col) {
+
+  # Use the actual PET acquisition date from ATNV.
+  # Collapse repeated references to the same participant/PET date/status.
+  pet_visits <- atnv |>
+    transmute(
+      subid,
+      pet_date = as.Date(.data[[pet_date_col]]),
+      pet_status = tolower(trimws(as.character(.data[[status_col]])))
+    ) |>
+    filter(
+      !is.na(subid), !is.na(pet_date),
+      pet_status %in% c("negative", "positive")
+    ) |>
+    distinct()
+
+  # Avoid assigning an arbitrary status if the same PET date has both labels.
+  if (anyDuplicated(pet_visits[c("subid", "pet_date")]) > 0L) {
+    stop("Conflicting ", status_col, " values for the same participant and PET date.")
+  }
+
+  mri_pool |>
+    inner_join(pet_visits, by = "subid", relationship = "many-to-many") |>
+    mutate(
+      mri_minus_pet_days = as.integer(mri_date - pet_date),
+      abs_gap_days = abs(mri_minus_pet_days),
+      pet_positive = as.integer(pet_status == "positive")
+    ) |>
+    # For equal gaps, prefer the earlier MRI, then the earlier PET.
+    # subject breaks any remaining tie between same-day MRI scans.
+    arrange(subid, abs_gap_days, mri_date, pet_date, subject) |>
+    distinct(subid, .keep_all = TRUE)
+}
+
+pet_data <- list(
+  "Amyloid PET" = closest_mri_to_pet("amy_date_atnv", "amyloid_status"),
+  "Tau PET"     = closest_mri_to_pet("tau_date_atnv", "tau_tmr_status")
+)
+
+# Verify one MRI per participant and summarize how far apart the visits were.
+pet_counts <- imap_dfr(pet_data, function(d, marker) {
+  stopifnot(nrow(d) == n_distinct(d$subid))
+
+  tibble(
+    marker = marker,
+    participants = n_distinct(d$subid),
+    mri_scans = nrow(d),
+    pet_negative = sum(d$pet_positive == 0),
+    pet_positive = sum(d$pet_positive == 1),
+    median_gap_days = median(d$abs_gap_days),
+    within_1_year = sum(d$abs_gap_days <= 365),
+    over_1_year = sum(d$abs_gap_days > 365)
+  )
+})
+
+print(pet_counts, width = Inf)
+
+
+
+```
+```{r}
+pet_results <- imap_dfr(pet_data, function(cohort, marker) {
+  imap_dfr(regions, function(volume_col, region_label) {
+
+    d <- cohort |>
+      transmute(subid, volume = .data[[volume_col]], etiv_mm3, pet_positive) |>
+      filter(is.finite(volume), is.finite(etiv_mm3))
+
+    if (n_distinct(d$pet_positive) < 2) {
+      stop("Both PET groups are required for ", marker, " / ", region_label)
+    }
+
+    fit <- lm(volume ~ etiv_mm3 + pet_positive, data = d)
+
+    # Participant-clustered standard errors for repeated MRI scans
+    test <- clubSandwich::coef_test(
+      fit, vcov = "CR2", cluster = d$subid, test = "Satterthwaite"
+    )
+    pet <- test[match("pet_positive", names(coef(fit))), ]
+    margin <- qt(0.975, df = pet$df_Satt) * pet$SE
+
+    tibble(
+      marker = marker,
+      region = region_label,
+      participants = n_distinct(d$subid),
+      mri_scans = nrow(d),
+      difference_mm3 = pet$beta,
+      ci_low_mm3 = pet$beta - margin,
+      ci_high_mm3 = pet$beta + margin,
+      p = pet$p_Satt
+    )
+  })
+}) |>
+  mutate(
+    p_fdr = p.adjust(p, method = "BH"),  # 2 PET markers × 6 volumes
+    significant_fdr = p_fdr < 0.05
+  )
+
+pet_results |>
+  mutate(across(c(difference_mm3, ci_low_mm3, ci_high_mm3, p, p_fdr),
+                ~ signif(.x, 4))) |>
+  print(n = Inf, width = Inf)
+
+write.csv(pet_counts, file.path(output_dir, "hypothalamus_PET_counts.csv"),
+          row.names = FALSE)
+write.csv(pet_results, file.path(output_dir, "hypothalamus_PET_eTIV_FDR.csv"),
+          row.names = FALSE)
+```
+```{r}
+library(dplyr)
+library(purrr)
+library(tibble)
+
+regions <- c(
+  "Anterior inferior"  = "hypo_bilateral_anterior_inferior_mm3",
+  "Anterior superior"  = "hypo_bilateral_anterior_superior_mm3",
+  "Posterior"          = "hypo_bilateral_posterior_mm3",
+  "Tubular inferior"   = "hypo_bilateral_tubular_inferior_mm3",
+  "Tubular superior"   = "hypo_bilateral_tubular_superior_mm3",
+  "Whole hypothalamus" = "hypo_total_mm3"
+)
+
+# The increment sets the scale of the reported coefficient.
+pet_specs <- tribble(
+  ~predictor,         ~date_col,       ~value_col,       ~binary, ~increment,
+  "Amyloid status",   "amy_date_atnv", "amyloid_status", TRUE,     1,
+  "Amyloid Centiloid","amy_date_atnv", "a_centiloid",    FALSE,   10,
+  "Tau status",       "tau_date_atnv", "tau_tmr_status", TRUE,     1,
+  "Tau TMR",          "tau_date_atnv", "t_tmr",          FALSE,    0.1
+)
+
+mri_pool <- datasets[["01_base"]] |>
+  select(subid, subject, mri_date, etiv_mm3, all_of(unname(regions))) |>
+  mutate(mri_date = as.Date(mri_date)) |>
+  filter(!is.na(subid), !is.na(mri_date), is.finite(etiv_mm3))
+
+# 1. Select the closest eligible MRI–PET pair for each person and predictor.
+match_pet <- function(predictor, date_col, value_col, binary, increment) {
+  raw <- trimws(as.character(atnv[[value_col]]))
+
+  if (binary) {
+    value <- case_when(
+      tolower(raw) == "positive" ~ 1,
+      tolower(raw) == "negative" ~ 0,
+      TRUE ~ NA_real_
+    )
+  } else {
+    value <- as.numeric(raw)
+  }
+
+  visits <- tibble(
+    subid = atnv$subid,
+    pet_date = as.Date(atnv[[date_col]]),
+    pet_value = value
+  ) |>
+    filter(!is.na(subid), !is.na(pet_date), is.finite(pet_value)) |>
+    distinct()
+
+  # Repeated ATNV rows for one PET visit are fine if their values agree.
+  if (anyDuplicated(visits[c("subid", "pet_date")]) > 0L) {
+    stop("Conflicting ", value_col, " values for the same participant and PET date.")
+  }
+
+  mri_pool |>
+    inner_join(visits, by = "subid", relationship = "many-to-many") |>
+    mutate(gap_days = abs(as.integer(mri_date - pet_date))) |>
+    arrange(subid, gap_days, mri_date, pet_date, subject) |>
+    distinct(subid, .keep_all = TRUE) |>
+    mutate(predictor = .env$predictor, x = pet_value / increment)
+}
+
+pet_matched <- pmap(pet_specs, match_pet) |> bind_rows()
+
+# Show the actual sample size and MRI–PET separation for each predictor.
+pet_counts <- pet_matched |>
+  group_by(predictor) |>
+  summarise(
+    participants = n_distinct(subid),
+    mri_scans = n(),
+    median_gap_days = median(gap_days),
+    over_365_days = sum(gap_days > 365),
+    .groups = "drop"
+  )
+
+print(pet_counts)
+
+# 2. Fit each region separately: volume ~ PET predictor + eTIV.
+fit_regions <- function(cohort) {
+  imap_dfr(regions, function(volume_col, region_name) {
+    d <- cohort |>
+      transmute(volume = .data[[volume_col]], x, etiv_mm3) |>
+      filter(is.finite(volume))
+
+    fit <- lm(volume ~ x + etiv_mm3, data = d)
+    coef_x <- coef(summary(fit))["x", ]
+    ci <- confint(fit, parm = "x")
+    t_value <- unname(coef_x["t value"])
+
+    tibble(
+      region = region_name,
+      n = nrow(d),
+      B_mm3 = unname(coef_x["Estimate"]),
+      ci_low = ci[1, 1],
+      ci_high = ci[1, 2],
+      partial_r = t_value / sqrt(t_value^2 + df.residual(fit)),
+      p = unname(coef_x["Pr(>|t|)"])
+    )
+  })
+}
+
+pet_results <- pet_matched |>
+  group_by(predictor) |>
+  group_modify(~ fit_regions(.x)) |>
+  ungroup() |>
+  mutate(
+    p_fdr = p.adjust(p, method = "BH"),  # all 4 predictors × 6 volumes
+    significant_fdr = p_fdr < 0.05
+  )
+
+pet_results |>
+  mutate(across(c(B_mm3, ci_low, ci_high, partial_r, p, p_fdr),
+                ~ signif(.x, 4))) |>
+  print(n = Inf, width = Inf)
+
+write.csv(pet_results,
+          file.path(output_dir, "hypothalamus_PET_status_and_continuous_eTIV.csv"),
+          row.names = FALSE)
+```
+
+```{r}
+
+
+# Modified PSQI sleep-disturbance outcome using 5b–5i.
+# Eight items scored 0–3 give a total of 0–24.
+# Apply the raw-score cutoff corresponding to Laurell's component score ≥2:
+# 0–9 = lower disturbance; 10–24 = higher disturbance.
+# Because 5j is unavailable, this approximates the published outcome.
+items <- paste0("sleep_psq5", letters[2:9])
+
+regions <- c(
+  "Anterior inferior"  = "hypo_bilateral_anterior_inferior_mm3",
+  "Anterior superior"  = "hypo_bilateral_anterior_superior_mm3",
+  "Posterior"          = "hypo_bilateral_posterior_mm3",
+  "Tubular inferior"   = "hypo_bilateral_tubular_inferior_mm3",
+  "Tubular superior"   = "hypo_bilateral_tubular_superior_mm3",
+  "Whole hypothalamus" = "hypo_total_mm3"
+)
+
+sleep <- datasets[["06_base_sleep"]]
+
+# Use the harmonized 0–3 item scores. Flag unexpected codes before scoring.
+stopifnot(all(vapply(
+  sleep[items],
+  function(x) all(is.na(x) | x %in% 0:3),
+  logical(1)
+)))
+
+# Among the available MRI–sleep pairs, keep the closest pair per participant.
+# No time restriction. For equal gaps, prefer the earlier MRI.
+dat <- sleep |>
+  filter(
+    !is.na(subid), !is.na(sleep_gap_days),
+    if_all(all_of(items), ~ !is.na(.x)),
+    is.finite(age_at_mri_years), !is.na(sex), is.finite(etiv_mm3)
+  ) |>
+  mutate(
+    across(all_of(items), ~ as.integer(as.character(.x))),
+    disturbance_sum = rowSums(pick(all_of(items))),
+    high_disturbance = as.integer(disturbance_sum >= 10),
+    sex = factor(sex)
+  ) |>
+  arrange(subid, abs(sleep_gap_days), mri_date, sleep_visitdate, subject) |>
+  distinct(subid, .keep_all = TRUE)
+
+# Check sample size, outcome balance, and MRI–sleep timing.
+dat |>
+  summarise(
+    participants = n(),
+    lower_disturbance = sum(high_disturbance == 0),
+    higher_disturbance = sum(high_disturbance == 1),
+    median_gap_days = median(abs(sleep_gap_days))
+  ) |>
+  print()
+
+# Six logistic regressions, one per volume.
+# Scale volume so OR > 1 means higher odds of disturbance per 1 SD SMALLER volume.
+results <- imap_dfr(regions, function(volume_col, region_name) {
+  d <- dat |>
+    filter(is.finite(.data[[volume_col]])) |>
+    mutate(smaller_volume_sd = -as.numeric(scale(.data[[volume_col]])))
+
+  fit <- glm(
+    high_disturbance ~ smaller_volume_sd + age_at_mri_years + sex + etiv_mm3,
+    data = d,
+    family = binomial()
+  )
+
+  term <- coef(summary(fit))["smaller_volume_sd", ]
+  b  <- unname(term["Estimate"])
+  se <- unname(term["Std. Error"])
+
+  tibble(
+    region = region_name,
+    n = nrow(d),
+    n_higher_disturbance = sum(d$high_disturbance),
+    OR_per_SD_smaller = exp(b),
+    CI_low = exp(b - 1.96 * se),
+    CI_high = exp(b + 1.96 * se),
+    p = unname(term["Pr(>|z|)"])
+  )
+}) |>
+  mutate(
+    p_fdr = p.adjust(p, method = "BH"),
+    significant_fdr = p_fdr < 0.05
+  )
+
+results |>
+  mutate(across(c(OR_per_SD_smaller, CI_low, CI_high, p, p_fdr),
+                ~ signif(.x, 4))) |>
+  print(n = Inf, width = Inf)
+
+write.csv(
+  results,
+  file.path(output_dir, "hypothalamus_PSQI_5b_5i_disturbance.csv"),
+  row.names = FALSE
+)
+```
+```{r}
+
+```
+
